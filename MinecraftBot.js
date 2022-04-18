@@ -4,7 +4,7 @@ const mineflayerViewer = require("prismarine-viewer").mineflayer;
 const Entity = require("prismarine-entity").Entity;
 var minecraft = require("minecraft-data")("1.18.2");
 
-const ownerName = ".Brianna_0w02039";
+const ownerName = "";
 
 const botToggleOptions = {
     
