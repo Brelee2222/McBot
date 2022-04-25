@@ -1,10 +1,17 @@
+const res = require("express/lib/response");
 const mineflayer = require("mineflayer");
 const Vec3 = require("./node_modules/vec3").Vec3;
 const mineflayerViewer = require("prismarine-viewer").mineflayer;
+const Item = require("prismarine-item")("1.18.2");
 const Entity = require("prismarine-entity").Entity;
 var minecraft = require("minecraft-data")("1.18.2");
+const nbt = require("prismarine-nbt");
+const algebra = require("./AlgebraicSolver");
 
 const ownerName = "";
+
+const masterNames = [
+]
 
 const botToggleOptions = {
     
@@ -27,14 +34,11 @@ const botToggleOptions = {
 }
 
 const authorizedUsers = [
-    "Brelee2222",
-    ".brelee2222",
-    ".Brianna_0w02039"
 ]
 
 const bot = mineflayer.createBot(require("./BotSettings")( {
     host : "",
-    port : 52286,
+    port : 54552,
     username : 1
 }));
 
@@ -47,7 +51,7 @@ bot.once("login", () => {
 bot.on("move", () => {
     for(actionType in botMoveActions)
         if(botMoveActions[actionType])
-            if(botMoveActions[actionType].run())
+            if(!botMoveActions[actionType].run())
                 break;
 });
 
@@ -61,15 +65,18 @@ bot.on("chat", botMessage);
 
 bot.on("health", () => console.log("[Debug]: Health has bee reduce to " + bot.health.toLocaleString()))
 
-bot.on("playerCollect", (collector, collectee) => {
-    if(collector != bot.entity)
-        return;
-    if(minecraft.items[collectee.metadata[8].itemId].enchantCategories == undefined) 
-        return;
-    console.log(collectee)
-    if(minecraft.items[collectee.metadata[8].itemId].enchantCategories.includes("armor"))
-        bot.moveSlotItem()
-}); 
+bot.on("death", () => {
+    botMoveActions.attack = null;
+    botMoveActions.forward = null;
+    botMoveActions.pathFind = null;
+    bot.controlState.back = false;
+    bot.controlState.left = false;
+    bot.controlState.right = false;
+    bot.controlState.jump = false;
+    bot.controlState.sneak = false;
+    bot.controlState.forward = false;
+    bot.controlState.sprint = false;
+});
 
 function doPathfinding(username, minDistance = 1.5, sprint = true) {
     if(!bot.players[username])
@@ -90,6 +97,13 @@ function doPathfindingToCoords(position = Vec3.prototype, minDistance = 1.5, spr
         bot.controlState.forward = true;
         bot.controlState.sprint = sprint;
     }
+}
+
+function attackPlayer(username) {
+    if(!bot.players[username])
+        return;
+    
+    botMoveActions.attack = new AttackEntity(bot.players[username].entity);
 }
 
 function followPlayer(username, ttl = 1200, minDistance = 1.5, sprint = true) {
@@ -116,7 +130,6 @@ function botMessage(username = "", message = "") {
         bot.controlState.forward = true;
         arg = Number(message.replace("foward ", ""));
         bot.waitForTicks(arg ?? 20).then(() => {bot.controlState.forward = false});
-        return;
     }
 
     if(message.startsWith("come") || message.startsWith("underoos")) {
@@ -128,17 +141,23 @@ function botMessage(username = "", message = "") {
             minDistance = Number(args[1]);
 
         doPathfinding(username, minDistance);
-        return;
     }
 
-    if(message.includes("goto ")) {
-        console.log("going to " + message.split("goto ")[1]);
-        startPathfinding(message.split("goto ")[1]);
-        bot.whisper(authorizedUsers[username], node ? "Coming" : "How do I get there?");
+    if(message.startsWith("goto ")) {
+        doPathfinding(message.replace("goto ").trim());
     }
 
-    if(message.includes("inventory of "))
-        console.log(bot.players[message.split("inventory of ")[1]].entity.equipment);
+    if(message.startsWith("get inventory")) {
+        const inventory = {};
+        for(slot of bot.inventory.slots)
+            if(slot)
+                if(inventory[slot.displayName] != undefined)
+                    inventory[slot.displayName]++;
+                else
+                    inventory[slot.displayName] = 1;
+        console.log(inventory);
+    }
+        
 }
 
 function lookAtOwner() {
@@ -167,12 +186,93 @@ function findBlocks(blockName) {
     bot.viewer.drawPoints("blocks", blockposes, 0xff0000, blockposes.length);
 }
 
+function switchItemSlot(number) {
+    bot.setQuickBarSlot(number);
+}
+
+function PvpEntity(entity) {
+    if(entity != bot.entity && !masterNames.includes(entity.username))
+        return;
+    bot.once("entitySwingArm", attacker => {
+        console.log(attacker.kind)
+        if(!masterNames.includes(attacker.username) || attacker.kind == "Hostile mobs")
+            if(botMoveActions.attack != null)
+                botMoveActions.attack.entities[botMoveActions.attack.entities.length] = attacker;
+            else
+                botMoveActions.attack = new AttackEntity(attacker);
+    });
+}
+
+function togglePvp() {
+    bot.listeners("entityHurt").includes(PvpEntity) ? bot.off("entityHurt", PvpEntity) : bot.on("entityHurt", PvpEntity);
+}
+
+function getProjTrajAim(targetVelocity = Vec3.prototype, targetPosition = Vec3.prototype, currentPosition = Vec3.prototype) {
+    let arrowSpeed = 250/20;
+    
+    let scaling = (1/(arrowSpeed * Math.acos(Math.sqrt(targetVelocity.x**2 + targetVelocity.z**2)/arrowSpeed**2)))**2;
+
+    let deltaPos = currentPosition.minus(targetPosition);
+
+    let dTargetDistance = targetVelocity.x**2 + targetVelocity.z**2;
+    let initalDistance = (targetPosition.x - currentPosition.x)**2 + (targetPosition.z - currentPosition.z)**2;
+    let bValue = 2*(targetVelocity.x*deltaPos.x + targetVelocity.z*deltaPos.z);
+
+    let scale = algebra(dTargetDistance*scaling, bValue*scaling, initalDistance*scaling - arrowSpeed);
+    if(Number.isNaN(scale.alpha))
+        return targetPosition;
+    let alphaPos = targetPosition.plus(targetVelocity.scaled(scale.alpha));
+    let betaPos = targetPosition.plus(targetVelocity.scaled(scale.beta));
+    return betaPos;
+}
+
+async function shootArrow() {
+    bot.setQuickBarSlot(0);
+    bot.activateItem(false);
+    let targetEntity = bot.entities[bot.nearestEntity(entity => entity != bot.entity && entity.type == "player").id];
+    let charged = false;
+
+    function wait() {
+        if(charged) 
+            return;
+        let targetVelocity = targetEntity.position.clone();
+        bot.waitForTicks(2).then(() => {
+
+            targetVelocity = targetVelocity.minus(targetEntity.position).scale(0.5);
+
+            let predictPos = getProjTrajAim(targetVelocity, targetEntity.position, bot.entity.position);
+            
+            let deltaPos = predictPos.minus(bot.entity.position);
+
+            bot.look(Math.atan2(-deltaPos.x, -deltaPos.z), (predictPos.distanceTo(bot.entity.position)/(250/20)**2)/3, true).then(wait);
+        });
+    }
+    wait();
+    return await new Promise(res => {
+        bot.waitForTicks(25).then(() => {
+            charged = true;
+            bot.deactivateItem(false);
+            setTimeout(() => res(), 0);
+        })
+    });
+}
+
+async function shootTarget() {
+    await shootArrow().finally(() => bot.once("physicTick", shootTarget));
+}
+
 async function dropInventory() {
     slots = bot.inventory.slots
     for(slot of slots)
         if(slot != null && slot != undefined)
             await bot.tossStack(slot);
 }
+
+function toggleBowing() {
+    bot.once("physicTick", shootTarget);
+}
+
+//Bot AI states
 
 class MoveAction {
     run() {};
@@ -254,7 +354,7 @@ class PathFinding {
             this.processPosition(position);
             let nodePos = this.isOccupiedPosition(position);
             if(nodePos) {
-                if(nodePos.generation > currentNode.generation+1) {
+                if(nodePos.generation > currentNode.generation) {
                     currentNode.children[++currentNode.totalActiveChildren] = nodePos;
                     nodePos.parentNode = currentNode;
                     nodePos.generation = currentNode.generation+1;
@@ -295,7 +395,8 @@ class PathFinding {
     skipPath = [];
 
     startPathfinding(startPosition = Vec3.prototype, targetPosition = Vec3.prototype, minDistance = 2, maxDistanceAway = 20 ) {
-        this.skipPath.forEach(value => bot.viewer.erase(value.toString()))
+        this.skipPath.forEach(value => bot.viewer.erase(value.toString()));
+        this.skipPath = [];
         if(targetPosition.distanceTo(startPosition) < minDistance)
             return false;
         bot.waitForChunksToLoad();
@@ -336,10 +437,6 @@ class PathFinding {
                 return false;
         }
 
-        while(currentNode != undefined) {
-            currentNode = this.movements.move(currentNode, targetPosition);
-        }
-
         endNode.currentPath = null;
 
         currentNode = endNode;
@@ -360,8 +457,9 @@ class PathFinding {
                         if(this.getBlockClearance(currentNode.position.offset(-hitBoxRadius, 0, -hitBoxRadius), lastNode.position.offset(-hitBoxRadius, 0, -hitBoxRadius)))
                             if(this.getBlockClearance(currentNode.position.offset(hitBoxRadius, 0, -hitBoxRadius), lastNode.position.offset(hitBoxRadius, 0, -hitBoxRadius)))
                                 if(this.getBlockClearance(currentNode.position.offset(-hitBoxRadius, 0, hitBoxRadius), lastNode.position.offset(-hitBoxRadius, 0, hitBoxRadius))) {
+                                    this.skipPath[this.skipPath.length] = currentNode.position;
                                     currentNode.currentPath = lastNode;
-                                    continue;  
+                                    break;  
                                 }
                 } else 
                     break;
@@ -400,9 +498,54 @@ class AttackEntity extends MoveAction {
 
     entities = [];
 
-    constructor(entity) {
+    critActive;
+
+    hasCrit;
+
+    constructor(entity, critActive = true) {
         super();
+        new PlayerFollow(entity, 999999, 3, true);
         this.entities[0] = entity;
+        this.critActive = critActive ?? false;
+    }
+
+    run = async function() {
+        if(this.entities.length == 0) {
+            botMoveActions.attack = null;
+            return true;
+        }
+        let nearestTargetEntity = bot.nearestEntity(entity => this.entities.includes(entity));
+
+        if(nearestTargetEntity == null) {
+            this.entities.splice(this.entities.indexOf(nearestTargetEntity), 1);
+            this.follow = () => {};
+            return;
+        }
+
+        let distance = bot.entity.position.distanceTo(nearestTargetEntity.position);
+
+        let attacked = false;
+
+        for(let entity of this.entities) {
+            if(!entity) {
+                this.entities.splice(this.entities.indexOf(entity), 1);
+                continue;
+            }
+            if(distance < 4) {
+                attacked = true;
+                if(bot.entity.onGround) {
+                    bot.jumpTicks = 0;
+                    bot.jumpQueued = true;
+                    this.hasCrit = false;
+                }
+                if(distance < 3 && !bot.entity.onGround && bot.entity.velocity.y < -0.1 && !this.hasCrit) {
+                    bot.lookAt(nearestTargetEntity.position);
+                    bot.attack(nearestTargetEntity);
+                    this.hasCrit = true;
+                }
+            }
+        }
+        return true;
     }
 }
 
@@ -466,6 +609,14 @@ class PlayerFollow {
 
     follow = () => {
         let entity = bot.entities[this.entity]
+        if(!entity) {
+            botMoveActions.pathFind = null;
+            bot.controlState.forward = false;
+            bot.controlState.sprint = false;
+            bot.controlState.jump = false;
+            return;
+        } 
+
         this.findPathPromise(entity);
         bot.waitForTicks(10).then(() => bot.once("physicTick", this.follow));
     }
@@ -474,9 +625,9 @@ class PlayerFollow {
 const pathFinding = new PathFinding();
 
 const botMoveActions = {
-    pathFind : MoveAction.prototype,
-    attack : MoveAction.prototype,
-    forward : MoveAction.prototype
+    attack : null,
+    pathFind : null,
+    forward : null
 };
 
 const remoteBot = new class {
@@ -525,7 +676,13 @@ const remoteBot = new class {
         console.log(toggleLookAtNearest);
         return true;
     }
-    
+
+    get toggleBotPvp() {
+        console.log(bot.listeners("entityHurt"))
+        togglePvp();
+        console.log(toggleBotPvp)
+        return true;
+    }
 }
 
 globalThis.run = {
@@ -533,10 +690,16 @@ globalThis.run = {
     remoteBot,
     authorizedUsers,
     minecraft,
+    nbt,
     doPathfinding,
     doPathfindingToCoords,
     toggleOption,
     findBlocks,
     followPlayer,
-    dropInventory
+    dropInventory,
+    switchItemSlot,
+    attackPlayer,
+    togglePvp,
+    shootArrow,
+    toggleBowing
 }
