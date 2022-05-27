@@ -1,0 +1,1 @@
+The pathfinder doesn't incorperate the Dijkstra's algo, but in order to do it on a x by x plane, you need to have two phase of the algo. 1 that makes paths, and the other that finds those paths to paths.
